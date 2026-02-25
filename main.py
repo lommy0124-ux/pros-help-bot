@@ -3,11 +3,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -29,7 +25,6 @@ TEAM_CHAT_ID = -1003421664311
 # 초대링크 설정
 INVITE_EXPIRE_MINUTES = 30  # 만료 30분
 INVITE_MEMBER_LIMIT = 1     # 1회용
-
 
 # ====== DB (SQLite) ======
 DB_PATH = "pros_bot.db"
@@ -193,16 +188,11 @@ def safe_username(user) -> str:
     return f"@{user.username}" if getattr(user, "username", None) else "(no username)"
 
 
-def is_admin_chat(update: Update) -> bool:
-    return update.effective_chat and update.effective_chat.id == ADMIN_CHAT_ID
-
-
 def kst_now_str() -> str:
     return datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M KST")
 
 
 def admin_uid_buttons(uid: str) -> InlineKeyboardMarkup:
-    # callback_data는 64바이트 제한이 있으니 짧게 유지
     keyboard = [[
         InlineKeyboardButton("✅ 승인", callback_data=f"appr:{uid}"),
         InlineKeyboardButton("❌ 거절", callback_data=f"rej:{uid}"),
@@ -212,14 +202,23 @@ def admin_uid_buttons(uid: str) -> InlineKeyboardMarkup:
 
 # ====== USER HANDLERS ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ✅ 그룹/슈퍼그룹에서는 조용히 (DM에서만 안내)
+    if update.effective_chat.type != "private":
+        return
+
     context.user_data.clear()
     await update.message.reply_text(START_TEXT, reply_markup=main_menu())
 
 
 async def user_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
+    # ✅ 유저 메뉴 버튼은 DM에서만 반응
+    if query.message.chat.type != "private":
+        await query.answer("개인 채팅(DM)에서 이용해주세요.", show_alert=True)
+        return
+
+    await query.answer()
     data = query.data
 
     if data == "join":
@@ -248,6 +247,10 @@ async def user_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ✅ 그룹/슈퍼그룹에서는 어떤 텍스트에도 응답하지 않음 (스팸 방지)
+    if update.effective_chat.type != "private":
+        return
+
     mode = context.user_data.get("mode")
     text = (update.message.text or "").strip()
     user = update.effective_user
@@ -358,9 +361,9 @@ async def admin_action_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 expire_date=expire_ts,
                 member_limit=INVITE_MEMBER_LIMIT,
             )
-        except Exception as e:
+        except Exception:
             await query.edit_message_text(
-                (query.message.text or "") + "\n\n❌ 초대링크 생성 실패(봇 권한 확인 필요)."
+                (query.message.text or "") + "\n\n❌ 초대링크 생성 실패(메인 팀방에서 봇 권한 확인 필요)."
             )
             return
 
@@ -419,16 +422,21 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # /start (유저 메뉴 오픈)
+    # /start (유저 메뉴 오픈) - DM에서만 동작
     app.add_handler(CommandHandler("start", start))
 
-    # 유저 메뉴 버튼
-    app.add_handler(CallbackQueryHandler(user_button_handler, pattern=r"^(join|uid|record|faq|inquiry|benefit)$"))
+    # 유저 메뉴 버튼 - DM에서만 동작
+    app.add_handler(
+        CallbackQueryHandler(
+            user_button_handler,
+            pattern=r"^(join|uid|record|faq|inquiry|benefit)$",
+        )
+    )
 
-    # 운영진 승인/거절 버튼
+    # 운영진 승인/거절 버튼 (운영진 그룹에서만 동작)
     app.add_handler(CallbackQueryHandler(admin_action_handler, pattern=r"^(appr:|rej:)"))
 
-    # 유저 텍스트 처리(UID 제출/문의)
+    # 유저 텍스트 처리(UID 제출/문의) - DM에서만 동작
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.run_polling()
