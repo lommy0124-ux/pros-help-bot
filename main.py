@@ -19,6 +19,10 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # 운영진 비공개 그룹(문의 + UID 승인 처리) Chat ID
 ADMIN_CHAT_ID = -1003893914544
 
+# ✅ Topics thread ids (네가 링크로 뽑은 값)
+ADMIN_UID_THREAD_ID = 49   # 가입승인
+ADMIN_QNA_THREAD_ID = 48   # 문의
+
 # 실제 초대할 메인 팀방 Chat ID
 TEAM_CHAT_ID = -1003421664311
 
@@ -276,7 +280,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ UID {uid} 접수 완료.\n운영진 확인 후 초대 링크를 발송합니다."
         )
 
-        # 운영진 그룹 알림 + 승인/거절 버튼
+        # 운영진 그룹 알림 + 승인/거절 버튼 (✅ 가입승인 토픽으로 보냄)
         admin_text = (
             "✅ [UID 접수]\n\n"
             f"시간: {kst_now_str()}\n"
@@ -288,6 +292,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await context.bot.send_message(
             chat_id=ADMIN_CHAT_ID,
+            message_thread_id=ADMIN_UID_THREAD_ID,  # ✅ 토픽 분기
             text=admin_text,
             reply_markup=admin_uid_buttons(uid),
         )
@@ -299,6 +304,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "inquiry":
         await context.bot.send_message(
             chat_id=ADMIN_CHAT_ID,
+            message_thread_id=ADMIN_QNA_THREAD_ID,  # ✅ 토픽 분기
             text=(
                 "📩 [1:1 문의 접수]\n\n"
                 f"시간: {kst_now_str()}\n"
