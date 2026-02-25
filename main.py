@@ -1,10 +1,13 @@
 import os
 import re
 import sqlite3
-import time
 from datetime import datetime, timedelta, timezone
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -17,7 +20,7 @@ from telegram.ext import (
 # ====== ENV / IDS ======
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# 운영진 비공개 그룹(문의+승인 처리) Chat ID
+# 운영진 비공개 그룹(문의 + UID 승인 처리) Chat ID
 ADMIN_CHAT_ID = -1003893914544
 
 # 실제 초대할 메인 팀방 Chat ID
@@ -45,7 +48,7 @@ def db_init():
                 uid TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL,
                 username TEXT,
-                full_name TEXT,
+                full_name TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',   -- pending/approved/rejected
                 decided_at TEXT
@@ -59,7 +62,6 @@ def upsert_uid(uid: str, user_id: int, username: str | None, full_name: str):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     with db_conn() as con:
         cur = con.cursor()
-        # 같은 UID가 재제출되면 최신 유저정보로 덮고 status를 pending으로 되돌림
         cur.execute(
             """
             INSERT INTO uid_submissions(uid, user_id, username, full_name, created_at, status, decided_at)
@@ -96,22 +98,6 @@ def set_status(uid: str, status: str):
             (status, now, uid),
         )
         con.commit()
-
-
-def list_pending(limit: int = 20):
-    with db_conn() as con:
-        cur = con.cursor()
-        cur.execute(
-            """
-            SELECT uid, user_id, username, full_name, created_at
-            FROM uid_submissions
-            WHERE status='pending'
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        )
-        return cur.fetchall()
 
 
 # ====== TEXTS ======
@@ -189,7 +175,7 @@ BENEFIT_TEXT = """💎 Bitunix 혜택
 """
 
 
-# ====== MENU (order fixed as requested) ======
+# ====== MENU (order fixed) ======
 def main_menu() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("🚀 입장 방법", callback_data="join")],
@@ -203,25 +189,34 @@ def main_menu() -> InlineKeyboardMarkup:
 
 
 # ====== HELPERS ======
-def safe_username(u) -> str:
-    return f"@{u.username}" if getattr(u, "username", None) else "(no username)"
+def safe_username(user) -> str:
+    return f"@{user.username}" if getattr(user, "username", None) else "(no username)"
 
 
 def is_admin_chat(update: Update) -> bool:
     return update.effective_chat and update.effective_chat.id == ADMIN_CHAT_ID
 
 
-async def send_admin(text: str, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
+def kst_now_str() -> str:
+    return datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M KST")
 
 
-# ====== HANDLERS ======
+def admin_uid_buttons(uid: str) -> InlineKeyboardMarkup:
+    # callback_data는 64바이트 제한이 있으니 짧게 유지
+    keyboard = [[
+        InlineKeyboardButton("✅ 승인", callback_data=f"appr:{uid}"),
+        InlineKeyboardButton("❌ 거절", callback_data=f"rej:{uid}"),
+    ]]
+    return InlineKeyboardMarkup(keyboard)
+
+
+# ====== USER HANDLERS ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(START_TEXT, reply_markup=main_menu())
 
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def user_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
@@ -274,41 +269,38 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ UID {uid} 접수 완료.\n운영진 확인 후 초대 링크를 발송합니다."
         )
 
-        # 운영진 그룹 알림 (+ 승인 커맨드 안내)
-        now_kst = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M KST")
-        await send_admin(
-            (
-                "✅ [UID 접수]\n\n"
-                f"시간: {now_kst}\n"
-                f"유저: {user.full_name} ({safe_username(user)})\n"
-                f"유저링크: tg://user?id={user.id}\n"
-                f"UserID: {user.id}\n"
-                f"UID: {uid}\n\n"
-                f"승인: /approve {uid}\n"
-                f"거절: /reject {uid}\n"
-                "대기목록: /pending"
-            ),
-            context,
+        # 운영진 그룹 알림 + 승인/거절 버튼
+        admin_text = (
+            "✅ [UID 접수]\n\n"
+            f"시간: {kst_now_str()}\n"
+            f"유저: {user.full_name} ({safe_username(user)})\n"
+            f"유저링크: tg://user?id={user.id}\n"
+            f"UserID: {user.id}\n"
+            f"UID: {uid}"
+        )
+
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=admin_text,
+            reply_markup=admin_uid_buttons(uid),
         )
 
         context.user_data.clear()
         return
 
-    # ---- Inquiry mode (free input) ----
+    # ---- Inquiry mode ----
     if mode == "inquiry":
-        now_kst = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M KST")
-
-        await send_admin(
-            (
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=(
                 "📩 [1:1 문의 접수]\n\n"
-                f"시간: {now_kst}\n"
+                f"시간: {kst_now_str()}\n"
                 f"유저: {user.full_name} ({safe_username(user)})\n"
                 f"유저링크: tg://user?id={user.id}\n"
                 f"UserID: {user.id}\n\n"
                 "문의내용:\n"
                 f"{text}"
             ),
-            context,
         )
 
         await update.message.reply_text(
@@ -324,135 +316,99 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("메뉴는 /start 를 눌러 진행해주세요.")
 
 
-# ====== ADMIN COMMANDS (run ONLY in admin group) ======
-async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_chat(update):
+# ====== ADMIN BUTTON HANDLER ======
+async def admin_action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data or ""
+
+    # 운영진 그룹에서만 작동
+    if query.message.chat_id != ADMIN_CHAT_ID:
+        await query.answer("운영진 전용 기능입니다.", show_alert=True)
         return
 
-    rows = list_pending(limit=20)
-    if not rows:
-        await update.message.reply_text("대기 UID 없음 ✅")
+    # appr:UID / rej:UID
+    if ":" not in data:
+        await query.answer()
         return
 
-    lines = ["⏳ [대기 UID 목록] (최신 20개)\n"]
-    for uid, user_id, username, full_name, created_at in rows:
-        u = f"@{username}" if username else "(no username)"
-        lines.append(f"- UID {uid} | {full_name} {u} | {created_at} | user_id={user_id}")
-    await update.message.reply_text("\n".join(lines))
+    action, uid = data.split(":", 1)
+    uid = uid.strip()
 
-
-async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_chat(update):
-        return
-
-    parts = (update.message.text or "").split()
-    if len(parts) < 2:
-        await update.message.reply_text("사용법: /approve 12345678")
-        return
-
-    uid = parts[1].strip()
     row = get_uid_row(uid)
     if not row:
-        await update.message.reply_text(f"해당 UID 없음: {uid}")
+        await query.answer("UID 데이터를 찾을 수 없습니다.", show_alert=True)
         return
 
-    _, user_id, username, full_name, created_at, status, _ = row
+    _, user_id, username, full_name, created_at, status, decided_at = row
 
-    if status == "approved":
-        await update.message.reply_text(f"이미 승인됨: {uid}")
-        return
-    if status == "rejected":
-        await update.message.reply_text(f"이미 거절됨: {uid}")
+    if status in ("approved", "rejected"):
+        await query.answer("이미 처리된 UID입니다.", show_alert=True)
         return
 
-    # 1회용 초대링크 생성
-    expire_dt = datetime.now(timezone.utc) + timedelta(minutes=INVITE_EXPIRE_MINUTES)
-    expire_ts = int(expire_dt.timestamp())
+    await query.answer()  # 로딩 해제
 
-    try:
-        invite = await context.bot.create_chat_invite_link(
-            chat_id=TEAM_CHAT_ID,
-            expire_date=expire_ts,
-            member_limit=INVITE_MEMBER_LIMIT,
+    if action == "appr":
+        # 1회용 초대링크 생성
+        expire_dt = datetime.now(timezone.utc) + timedelta(minutes=INVITE_EXPIRE_MINUTES)
+        expire_ts = int(expire_dt.timestamp())
+
+        try:
+            invite = await context.bot.create_chat_invite_link(
+                chat_id=TEAM_CHAT_ID,
+                expire_date=expire_ts,
+                member_limit=INVITE_MEMBER_LIMIT,
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                (query.message.text or "") + "\n\n❌ 초대링크 생성 실패(봇 권한 확인 필요)."
+            )
+            return
+
+        # 유저에게 DM 발송
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "✅ 승인 완료되었습니다.\n\n"
+                    f"아래 링크로 입장해주세요. (1회용 / 만료 {INVITE_EXPIRE_MINUTES}분)\n"
+                    f"{invite.invite_link}"
+                ),
+            )
+        except Exception:
+            await query.edit_message_text(
+                (query.message.text or "")
+                + "\n\n❌ 유저 DM 발송 실패(유저가 봇 차단/대화 미시작 가능)."
+            )
+            return
+
+        set_status(uid, "approved")
+
+        await query.edit_message_text(
+            (query.message.text or "")
+            + f"\n\n✅ 승인 완료\n- 대상: {full_name} ({('@'+username) if username else 'no username'})\n- UID: {uid}\n- 1회용 링크 DM 발송됨",
         )
-    except Exception as e:
-        await update.message.reply_text(
-            "❌ 초대링크 생성 실패.\n"
-            "메인 팀방에서 봇 권한(초대 링크 생성)을 확인해주세요.\n"
-            f"에러: {type(e).__name__}"
+        return
+
+    if action == "rej":
+        # 유저에게 보류 안내(선택)
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "❌ 승인 조건이 충족되지 않아 입장이 보류되었습니다.\n\n"
+                    "확인 후 다시 UID 제출 부탁드립니다."
+                ),
+            )
+        except Exception:
+            pass
+
+        set_status(uid, "rejected")
+
+        await query.edit_message_text(
+            (query.message.text or "")
+            + f"\n\n❌ 거절 처리 완료\n- 대상: {full_name} ({('@'+username) if username else 'no username'})\n- UID: {uid}",
         )
         return
-
-    # 유저에게 DM 발송
-    try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                "✅ 승인 완료되었습니다.\n\n"
-                f"아래 링크로 입장해주세요. (1회용 / 만료 {INVITE_EXPIRE_MINUTES}분)\n"
-                f"{invite.invite_link}"
-            ),
-        )
-    except Exception as e:
-        await update.message.reply_text(
-            "❌ 유저에게 DM 발송 실패.\n"
-            "유저가 봇을 차단했거나, 봇과 대화를 시작하지 않았을 수 있습니다.\n"
-            f"에러: {type(e).__name__}"
-        )
-        return
-
-    set_status(uid, "approved")
-
-    await update.message.reply_text(
-        f"✅ 승인 처리 완료: {uid}\n"
-        f"- 유저: {full_name} ({'@'+username if username else 'no username'})\n"
-        f"- 링크(1회용/만료): 생성 완료 & DM 발송됨"
-    )
-
-
-async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_chat(update):
-        return
-
-    parts = (update.message.text or "").split()
-    if len(parts) < 2:
-        await update.message.reply_text("사용법: /reject 12345678")
-        return
-
-    uid = parts[1].strip()
-    row = get_uid_row(uid)
-    if not row:
-        await update.message.reply_text(f"해당 UID 없음: {uid}")
-        return
-
-    _, user_id, username, full_name, created_at, status, _ = row
-
-    if status == "approved":
-        await update.message.reply_text(f"이미 승인됨(거절 불가): {uid}")
-        return
-    if status == "rejected":
-        await update.message.reply_text(f"이미 거절됨: {uid}")
-        return
-
-    # 유저에게 안내(선택)
-    try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                "❌ 승인 조건이 충족되지 않아 입장이 보류되었습니다.\n\n"
-                "확인 후 다시 UID 제출 부탁드립니다."
-            ),
-        )
-    except Exception:
-        pass
-
-    set_status(uid, "rejected")
-    await update.message.reply_text(f"❌ 거절 처리 완료: {uid} | 유저: {full_name}")
-
-
-# (선택) Chat ID 확인 커맨드: 팀방에서 getidsbot 안될 때도 쓸 수 있음
-async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"This chat id is: {update.effective_chat.id}")
 
 
 def main():
@@ -463,18 +419,17 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # user side
+    # /start (유저 메뉴 오픈)
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
+
+    # 유저 메뉴 버튼
+    app.add_handler(CallbackQueryHandler(user_button_handler, pattern=r"^(join|uid|record|faq|inquiry|benefit)$"))
+
+    # 운영진 승인/거절 버튼
+    app.add_handler(CallbackQueryHandler(admin_action_handler, pattern=r"^(appr:|rej:)"))
+
+    # 유저 텍스트 처리(UID 제출/문의)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # admin side (admin group only)
-    app.add_handler(CommandHandler("pending", pending))
-    app.add_handler(CommandHandler("approve", approve))
-    app.add_handler(CommandHandler("reject", reject))
-
-    # utility
-    app.add_handler(CommandHandler("chatid", chatid))
 
     app.run_polling()
 
